@@ -1,5 +1,5 @@
 # app/serve.py
-import os
+import os, traceback
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -83,7 +83,15 @@ class RetrieveResponse(BaseModel):
     results: List[Dict[str, Any]]
 
 
-
+def format_docs_unique(docs):
+    seen, chunks = set(), []
+    for d in docs:
+        iid = d.metadata.get("issue_ID")
+        if iid in seen:
+            continue
+        seen.add(iid)
+        chunks.append(f"[{iid}]\n{d.page_content}")
+    return "\n\n".join(chunks)
 
 app = FastAPI(title="Issues RAG API", version="1.0.0")
 
@@ -95,24 +103,44 @@ app.add_middleware(
 
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
-    if req.top_k:
-        retriever.search_kwargs["k"] = req.top_k
-    docs = retriever.invoke(req.question)
-    if not docs:
-        return AskResponse(answer="I don't know.", citations=[])
-    answer = chain().invoke(req.question)
-    seen, cits = set(), []
-    for d in docs:
-        iid = d.metadata.get("issue_ID")
-        if iid and iid not in seen:
-            seen.add(iid)
-            cits.append({
-                "issue_ID": iid,
-                "category": d.metadata.get("category"),
-                "system": d.metadata.get("system"),
-                "severity": d.metadata.get("severity"),
-            })
-    return AskResponse(answer=answer, citations=cits)
+    try:
+        k = req.top_k or TOP_K
+        # 1) Retrieve once, here
+        docs = vs.similarity_search(query=req.question, k=k)
+        if not docs:
+            return AskResponse(answer="I don't know.", citations=[])
+
+        # 2) Build context from THESE docs
+        context = format_docs_unique(docs)
+
+        # 3) Call LLM explicitly with API key
+        OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+        if not OPENAI_KEY:
+            raise RuntimeError("OPENAI_API_KEY not set on server")
+
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, max_tokens=512, api_key=OPENAI_KEY)
+        rag = prompt | llm | StrOutputParser()
+        answer = rag.invoke({"context": context, "question": req.question})
+
+        # 4) Build citations (dedup by Issue ID)
+        seen, cits = set(), []
+        for d in docs:
+            iid = d.metadata.get("issue_ID")
+            if iid and iid not in seen:
+                seen.add(iid)
+                cits.append({
+                    "issue_ID": iid,
+                    "category": d.metadata.get("category"),
+                    "system": d.metadata.get("system"),
+                    "severity": d.metadata.get("severity"),
+                })
+
+        return AskResponse(answer=answer, citations=cits)
+
+    except Exception as e:
+        # Log full stack to Render logs and return detail
+        print("ERROR in /ask:\n", traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"/ask failed: {e}")
 
 
 @app.get("/health")
