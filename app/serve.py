@@ -11,6 +11,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Any, Dict, List
 
 # --- env ---
 load_dotenv()
@@ -35,7 +37,11 @@ vs = Qdrant.from_existing_collection(
     api_key=QDRANT_KEY,
     collection_name=COLL,
 )
-retriever = vs.as_retriever(search_kwargs={"k": TOP_K})
+retriever = vs.as_retriever(
+    search_type="mmr",
+    search_kwargs={"k": 5, "fetch_k": 30, "lambda_mult": 0.5}
+)
+
 
 # --- LLM & prompt ---
 SYSTEM = (
@@ -62,6 +68,16 @@ class AskRequest(BaseModel):
 class AskResponse(BaseModel):
     answer: str
     citations: List[Dict[str, Any]]
+
+class RetrieveRequest(BaseModel):
+    query: str
+    top_k: int | None = None
+    # optional metadata filter example (Qdrant)
+    category: str | None = None
+
+class RetrieveResponse(BaseModel):
+    results: List[Dict[str, Any]]
+
 
 app = FastAPI(title="Issues RAG API", version="1.0.0")
 
@@ -92,6 +108,29 @@ def ask(req: AskRequest):
             })
     return AskResponse(answer=answer, citations=cits)
 
+
 @app.get("/health")
 def health():
     return {"ok": True}
+
+@app.post("/retrieve", response_model=RetrieveResponse)
+def retrieve(req: RetrieveRequest):
+    # allow k override
+    if req.top_k:
+        retriever.search_kwargs["k"] = req.top_k
+
+    # OPTIONAL: apply a simple metadata filter (works with Qdrant)
+    if req.category:
+        # Qdrant filter JSON — only if you're using langchain-qdrant/Qdrant
+        retriever.search_kwargs["filter"] = {"must": [
+            {"key": "category", "match": {"value": req.category}}
+        ]}
+
+    docs = retriever.invoke(req.query)
+    return {"results": [
+        {
+            "issue_ID": d.metadata.get("issue_ID"),
+            "metadata": d.metadata,
+            "snippet": d.page_content[:500]
+        } for d in docs
+    ]}
