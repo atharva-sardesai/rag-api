@@ -48,8 +48,11 @@ retriever = vs.as_retriever(
 # --- LLM & prompt ---
 SYSTEM = (
     "You are a support assistant. Use ONLY the provided context. "
-    "If missing, say you don't know. Always cite Issue IDs used."
+    "If the context looks incomplete for an exhaustive answer, "
+    "return a best-effort answer using the retrieved items and say 'Based on top matches'. "
+    "Always cite Issue IDs used. Do NOT answer 'I don't know'; instead list the closest Issue IDs."
 )
+
 prompt = ChatPromptTemplate.from_messages([
     ("system", SYSTEM + "\n\nContext:\n{context}"),
     ("human", "{question}")
@@ -120,7 +123,18 @@ def ask(req: AskRequest):
 
         llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, max_tokens=512, api_key=OPENAI_KEY)
         rag = prompt | llm | StrOutputParser()
-        answer = rag.invoke({"context": context, "question": req.question})
+        answer = rag.invoke({"context": context, "question": req.question}).strip()
+
+        if not answer or "i don't know" in answer.lower():
+            # format a helpful list from the retrieved docs
+            lines, seen = [], set()
+            for d in docs:
+                iid = d.metadata.get("issue_ID")
+                if iid and iid not in seen:
+                    seen.add(iid)
+                    lines.append(f"- {iid} — {d.metadata.get('system')} — {d.metadata.get('status')}")
+            fallback = "No exact match. Based on top matches:\n" + ("\n".join(lines) if lines else "- (no matches)")
+            answer = fallback
 
         # 4) Build citations (dedup by Issue ID)
         seen, cits = set(), []
@@ -161,7 +175,8 @@ def retrieve(req: RetrieveRequest):
             ])
 
         # Call the vectorstore directly so we can pass the filter safely
-        docs = vs.similarity_search(query=req.query, k=k, filter=q_filter)
+        docs = retriever.get_relevant_documents(req.question)
+        docs = docs[:k] if k and len(docs) > k else docs
 
         return {"results": [
             {
