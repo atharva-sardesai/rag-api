@@ -26,6 +26,7 @@ qdrant_url = os.getenv("QDRANT_URL")
 qdrant_key = os.getenv("QDRANT_API_KEY")
 collection = os.getenv("QDRANT_COLLECTION","issues")
 
+
 def row_to_text(r):
     return (
       f"Issue ID: {r['issue_ID']}\n"
@@ -37,9 +38,11 @@ def row_to_text(r):
       f"System: {r.get('system','')}\n"
       f"Owner Team: {r.get('owner_team','')}\n"
       f"Status: {r.get('status','')}\n"
-      f"Assigned Person: {r.get('assigned_person','')}\n"   # <-- add this
+      f"Assigned Person: {r.get('assigned_person','')}\n"   # <— NEW
       f"Tags: {r.get('tags','')}"
     )
+
+
 
 def main():
     p = Path(data_file).expanduser()
@@ -50,15 +53,16 @@ def main():
     docs = []
     for _, r in df.iterrows():
         meta = {
-            "issue_ID":     r["issue_ID"],
-            "category":     norm_str(r.get("category")),
-            "severity":     norm_str(r.get("severity")),
-            "system":       norm_str(r.get("system"), lower=False),
-            "owner_team":   norm_str(r.get("owner_team")),
-            "status":       norm_str(r.get("status")),
-            "assigned_person": norm_str(r.get("assigned_person")),   # <-- add
-            "tags":            norm_str(r.get("tags")),              # <-- add (csv or words ok)
+            "issue_ID":       r["issue_ID"],
+            "category":       norm_str(r.get("category")),
+            "severity":       norm_str(r.get("severity")),
+            "system":         norm_str(r.get("system"), lower=False),
+            "owner_team":     norm_str(r.get("owner_team")),
+            "status":         norm_str(r.get("status")),
+            "assigned_person": norm_str(r.get("assigned_person")),   # <— NEW
+            "tags":            norm_str(r.get("tags")),              # <— NEW (csv or words ok)
         }
+
 
 
 
@@ -66,6 +70,7 @@ def main():
             page_content=row_to_text(r),
             metadata=meta
         ))
+
 
     
     emb = OpenAIEmbeddings(model="text-embedding-3-small")
