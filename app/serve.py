@@ -15,6 +15,51 @@ from pydantic import BaseModel
 from typing import Any, Dict, List
 from fastapi import HTTPException
 from qdrant_client.http.models import Filter as QFilter, FieldCondition, MatchValue
+import re
+from qdrant_client.http.models import Filter as QFilter, FieldCondition, MatchValue, MatchAny
+
+def parse_filters(q: str) -> dict:
+    ql = q.lower()
+    out = {}
+
+    # severity (allow multiple)
+    sev = [s for s in ["critical","high","medium","low"] if s in ql]
+    if sev: out["severity__any"] = sev
+
+    # site/product hints into tags
+    tags = []
+    for t in ["pune","chennai","bengaluru","hyderabad","mumbai","oracle","vpn","split_tunnel"]:
+        if t in ql: tags.append(t)
+    if tags: out["tags__any"] = tags
+
+    # assignee
+    m = re.search(r"assigned (?:to|person)\s+([a-z][a-z\.\-\s]+)", ql)
+    if m: out["assigned_person"] = m.group(1).strip()
+
+    # list intent
+    out["listy"] = any(x in ql for x in ["list","show","ids only","include issue id","return ids"])
+    return out
+
+
+def to_qdrant_filter(f: dict) -> QFilter | None:
+    must = []
+    if "assigned_person" in f:
+        must.append(FieldCondition(key="assigned_person", match=MatchValue(value=f["assigned_person"])))
+    if "severity__any" in f:
+        must.append(FieldCondition(key="severity", match=MatchAny(any=f["severity__any"])))
+    if "tags__any" in f:
+        must.append(FieldCondition(key="tags", match=MatchAny(any=f["tags__any"])))
+    return QFilter(must=must) if must else None
+
+def format_list_from_docs(docs, limit):
+    out, seen = [], set()
+    for d in docs:
+        iid = d.metadata.get("issue_ID")
+        if not iid or iid in seen: continue
+        seen.add(iid)
+        out.append(f"- {iid} — {d.metadata.get('system')} — {d.metadata.get('status')} — {d.metadata.get('assigned_person')}")
+        if len(out) >= limit: break
+    return "\n".join(out) if out else "No matching tickets found."
 
 # --- env ---
 load_dotenv()
@@ -48,10 +93,10 @@ retriever = vs.as_retriever(
 # --- LLM & prompt ---
 SYSTEM = (
     "You are a support assistant. Use ONLY the provided context. "
-    "If the context looks incomplete for an exhaustive answer, "
-    "return a best-effort answer using the retrieved items and say 'Based on top matches'. "
-    "Always cite Issue IDs used. Do NOT answer 'I don't know'; instead list the closest Issue IDs."
+    "If context is thin, return a best-effort answer prefixed with 'Based on top matches', "
+    "and list the Issue IDs used. Never answer 'I don't know'."
 )
+
 
 prompt = ChatPromptTemplate.from_messages([
     ("system", SYSTEM + "\n\nContext:\n{context}"),
@@ -108,35 +153,63 @@ app.add_middleware(
 def ask(req: AskRequest):
     try:
         k = req.top_k or TOP_K
-        # 1) Retrieve once, here
-        docs = vs.similarity_search(query=req.question, k=k)
+        f = parse_filters(req.question)
+        q_filter = to_qdrant_filter(f)
+
+        # Higher recall for listy questions
+        search_kwargs = {"k": max(k, 20)} if f.get("listy") else {"k": k}
+
+        # Use filter when present
+        if q_filter:
+            docs = vs.similarity_search(query=req.question, filter=q_filter, **search_kwargs)
+        else:
+            # you already have an MMR retriever defined; use it for general questions
+            docs = retriever.get_relevant_documents(req.question)
+            docs = docs[:k] if len(docs) > k else docs
+
+        # If it looks like a list/lookup, return a list from the docs directly
+        if f.get("listy") or q_filter:
+            if docs:
+                ans = format_list_from_docs(docs, k)
+                # citations
+                seen, cits = set(), []
+                for d in docs:
+                    iid = d.metadata.get("issue_ID")
+                    if iid and iid not in seen:
+                        seen.add(iid)
+                        cits.append({
+                            "issue_ID": iid,
+                            "category": d.metadata.get("category"),
+                            "system": d.metadata.get("system"),
+                            "severity": d.metadata.get("severity"),
+                            "status": d.metadata.get("status"),
+                            "assigned_person": d.metadata.get("assigned_person"),
+                        })
+                        if len(cits) >= k: break
+                return AskResponse(answer=ans, citations=cits)
+
         if not docs:
-            return AskResponse(answer="I don't know.", citations=[])
+            return AskResponse(
+                answer="No exact match found.\n\nRelated issues:\n- (none)\n\nNext steps:\nPlease refine filters or broaden the question.",
+                citations=[]
+            )
 
-        # 2) Build context from THESE docs
+        # Narrative path (RAG)
         context = format_docs_unique(docs)
-
-        # 3) Call LLM explicitly with API key
         OPENAI_KEY = os.getenv("OPENAI_API_KEY")
         if not OPENAI_KEY:
             raise RuntimeError("OPENAI_API_KEY not set on server")
 
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, max_tokens=512, api_key=OPENAI_KEY)
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, max_tokens=600, api_key=OPENAI_KEY)
         rag = prompt | llm | StrOutputParser()
         answer = rag.invoke({"context": context, "question": req.question}).strip()
 
+        # Guardrail: never return "I don't know"
         if not answer or "i don't know" in answer.lower():
-            # format a helpful list from the retrieved docs
-            lines, seen = [], set()
-            for d in docs:
-                iid = d.metadata.get("issue_ID")
-                if iid and iid not in seen:
-                    seen.add(iid)
-                    lines.append(f"- {iid} — {d.metadata.get('system')} — {d.metadata.get('status')}")
-            fallback = "No exact match. Based on top matches:\n" + ("\n".join(lines) if lines else "- (no matches)")
-            answer = fallback
+            ans = "Based on top matches:\n" + format_list_from_docs(docs, k)
+            answer = ans
 
-        # 4) Build citations (dedup by Issue ID)
+        # Citations
         seen, cits = set(), []
         for d in docs:
             iid = d.metadata.get("issue_ID")
@@ -147,12 +220,14 @@ def ask(req: AskRequest):
                     "category": d.metadata.get("category"),
                     "system": d.metadata.get("system"),
                     "severity": d.metadata.get("severity"),
+                    "status": d.metadata.get("status"),
+                    "assigned_person": d.metadata.get("assigned_person"),
                 })
+                if len(cits) >= k: break
 
         return AskResponse(answer=answer, citations=cits)
 
     except Exception as e:
-        # Log full stack to Render logs and return detail
         print("ERROR in /ask:\n", traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"/ask failed: {e}")
 
