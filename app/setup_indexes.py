@@ -10,7 +10,7 @@ coll = os.getenv("QDRANT_COLLECTION", "issues")
 
 client = QdrantClient(url=url, api_key=key)
 
-fields = ["category", "severity", "system", "owner_team", "status"]
+fields = ["category","severity","system","owner_team","status","tags","assigned_person","issue_ID"  ]
 for f in fields:
     try:
         client.create_payload_index(
