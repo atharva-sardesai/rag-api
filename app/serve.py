@@ -18,6 +18,8 @@ from qdrant_client.http.models import Filter as QFilter, FieldCondition, MatchVa
 import re
 from qdrant_client.http.models import Filter as QFilter, FieldCondition, MatchValue, MatchAny
 
+
+
 def parse_filters(q: str) -> dict:
     qn = q.lower().replace("—","-").replace("/", " ")
     f = {}
@@ -135,6 +137,59 @@ def chain():
         | prompt | llm | StrOutputParser()
     )
 
+def build_context(docs, max_chars=9000):
+    """Join unique docs into a compact context block."""
+    seen, chunks, total = set(), [], 0
+    for d in docs:
+        iid = d.metadata.get("issue_ID")
+        if iid in seen:
+            continue
+        seen.add(iid)
+        # Prefer a compact block: small header + remediation + a bit of content
+        header = (
+            f"Issue ID: {iid}\n"
+            f"Title: {d.metadata.get('issue_title') or ''}\n"
+            f"Severity: {d.metadata.get('severity')}; "
+            f"Category: {d.metadata.get('category')}; "
+            f"System: {d.metadata.get('system')}; "
+            f"Status: {d.metadata.get('status')}; "
+            f"Assigned: {d.metadata.get('assigned_person') or '-'}\n"
+        )
+        rem = d.metadata.get("remediation")
+        body = d.page_content or ""
+        # Prefer remediation if available
+        block = header + (f"Remediation: {rem}\n" if rem else "") + body
+        if total + len(block) > max_chars:
+            break
+        chunks.append(block)
+        total += len(block)
+    return "\n\n---\n\n".join(chunks) if chunks else ""
+
+LLM_SYSTEM = (
+    "You are a senior support engineer assistant. Use ONLY the provided CONTEXT.\n"
+    "Write a concise, actionable answer. If the user asks to list items, give a short summary first, "
+    "then include a clear step-by-step fix and any caveats. Explicitly reference Issue IDs in parentheses "
+    "when you use them (e.g., '... (ISS-01041)'). Do NOT invent facts outside the context.\n"
+)
+
+def synthesize_answer(question: str, docs):
+    context = build_context(docs)
+    if not context:
+        return ""  # will trigger our safe fallback
+    llm = ChatOpenAI(
+        model=os.getenv("CHAT_MODEL", "gpt-4o-mini"),
+        temperature=0.1,
+        max_tokens=800,
+        api_key=os.getenv("OPENAI_API_KEY"),
+    )
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", LLM_SYSTEM + "\nCONTEXT:\n{context}"),
+        ("human", "{question}")
+    ])
+    chain = prompt | llm | StrOutputParser()
+    return chain.invoke({"context": context, "question": question}).strip()
+
+
 # --- FastAPI app ---
 class AskRequest(BaseModel):
     question: str
@@ -190,9 +245,26 @@ def ask(req: AskRequest):
 
         # If listy or any filter used, return a list immediately
         if f.get("listy") or used_filter:
-            ans = format_list_from_docs(docs, k)
+            # First try a narrative LLM answer from the same docs
+            llm_answer = synthesize_answer(req.question, used_docs)
+
+            if not llm_answer or "i don't know" in llm_answer.lower():
+                # Safe fallback: helpful list with remediation snippets
+                preface = ""
+                strict = post_filter_docs(used_docs, f)
+                show_docs = strict if strict else used_docs
+                if not strict and (("severity__any" in f) or ("tags__any" in f)):
+                    want_sev = f.get("severity__any")
+                    want_tags = f.get("tags__any")
+                    bits = []
+                    if want_sev:  bits.append("severity=" + "/".join(want_sev))
+                    if want_tags: bits.append("tags=" + "/".join(want_tags))
+                    preface = f"No exact matches for ({', '.join(bits)}). Showing closest matches:\n"
+                llm_answer = preface + format_list_from_docs(show_docs, k, include_remediation=True)
+
+            # Citations (same as before)
             seen, cits = set(), []
-            for d in docs:
+            for d in used_docs:
                 iid = d.metadata.get("issue_ID")
                 if iid and iid not in seen:
                     seen.add(iid)
@@ -205,7 +277,9 @@ def ask(req: AskRequest):
                         "assigned_person": d.metadata.get("assigned_person"),
                     })
                     if len(cits) >= k: break
-            return AskResponse(answer=ans, citations=cits)
+
+            return AskResponse(answer=llm_answer, citations=cits)
+
 
         # Narrative RAG (non-list questions)
         context = format_docs_unique(docs)

@@ -78,8 +78,10 @@ def main():
             "owner_team":     norm_str(r.get("owner_team")),
             "status":         norm_str(r.get("status")),
             "assigned_person": norm_str(r.get("assigned_person")),
-            "tags":            extract_tags_from_row(r),   # <-- LIST, not a single string
+            "tags":            extract_tags_from_row(r),    # already added earlier
+            "remediation":     r.get("remediation"),        # <-- ADD THIS (keep original text)
         }
+
 
 
 
