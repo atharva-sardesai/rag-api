@@ -5,8 +5,26 @@ from langchain_community.vectorstores import Qdrant
 from langchain_community.vectorstores import Qdrant
 from langchain_openai import OpenAIEmbeddings
 from pathlib import Path
+import re
 
 
+def extract_tags_from_row(r) -> list[str] | None:
+    # Build a lowercase bag of all cell values in the row
+    bag = " ".join([str(r.get(c, "")) for c in r.index]).lower()
+
+    # Auto tokens we care about
+    vocab = ["oracle","vpn","split_tunnel","pune","chennai","bengaluru","hyderabad","mumbai"]
+
+    auto = [t for t in vocab if t in bag]
+
+    # Split the raw tags column (comma/semicolon/pipe)
+    extra = []
+    raw = r.get("tags")
+    if pd.notna(raw):
+        extra = [tok.strip().lower() for tok in re.split(r"[,\|;/]+", str(raw)) if tok.strip()]
+
+    tags = sorted(set(auto + extra))
+    return tags or None
 
 
 def norm_str(v, lower=True):
@@ -26,7 +44,6 @@ qdrant_url = os.getenv("QDRANT_URL")
 qdrant_key = os.getenv("QDRANT_API_KEY")
 collection = os.getenv("QDRANT_COLLECTION","issues")
 
-
 def row_to_text(r):
     return (
       f"Issue ID: {r['issue_ID']}\n"
@@ -38,9 +55,10 @@ def row_to_text(r):
       f"System: {r.get('system','')}\n"
       f"Owner Team: {r.get('owner_team','')}\n"
       f"Status: {r.get('status','')}\n"
-      f"Assigned Person: {r.get('assigned_person','')}\n"   # <— NEW
+      f"Assigned Person: {r.get('assigned_person','')}\n"
       f"Tags: {r.get('tags','')}"
     )
+
 
 
 
@@ -59,9 +77,10 @@ def main():
             "system":         norm_str(r.get("system"), lower=False),
             "owner_team":     norm_str(r.get("owner_team")),
             "status":         norm_str(r.get("status")),
-            "assigned_person": norm_str(r.get("assigned_person")),   # <— NEW
-            "tags":            norm_str(r.get("tags")),              # <— NEW (csv or words ok)
+            "assigned_person": norm_str(r.get("assigned_person")),
+            "tags":            extract_tags_from_row(r),   # <-- LIST, not a single string
         }
+
 
 
 
